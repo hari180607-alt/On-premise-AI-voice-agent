@@ -215,38 +215,44 @@ Output Schema:
         }
 
         client = get_http_client()
-        try:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            res_data = response.json()
-            content = res_data["message"]["content"]
+        last_error = None
+        for attempt in range(2):
+            try:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                res_data = response.json()
+                content = res_data["message"]["content"]
 
-            cleaned_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-            if "```" in cleaned_content:
-                match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned_content, re.DOTALL)
-                if match:
-                    cleaned_content = match.group(1)
-                else:
-                    cleaned_content = cleaned_content.replace("```json", "").replace("```", "").strip()
+                cleaned_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                if "```" in cleaned_content:
+                    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned_content, re.DOTALL)
+                    if match:
+                        cleaned_content = match.group(1)
+                    else:
+                        cleaned_content = cleaned_content.replace("```json", "").replace("```", "").strip()
 
-            start_idx = cleaned_content.find("{")
-            end_idx = cleaned_content.rfind("}")
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                cleaned_content = cleaned_content[start_idx:end_idx+1]
+                start_idx = cleaned_content.find("{")
+                end_idx = cleaned_content.rfind("}")
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    cleaned_content = cleaned_content[start_idx:end_idx+1]
 
-            return json.loads(cleaned_content)
-        except httpx.HTTPError as he:
-            logger.exception("Ollama connection error occurred:")
-            raise HTTPException(status_code=503, detail=f"Local AI engine is unavailable: {type(he).__name__} - {str(he)}")
-        except Exception as e:
-            logger.error(f"Failed to parse response from Qwen model: {str(e)}")
-            return {
-                "thought": "Fallback response",
-                "tool_call": None,
-                "tool_args": None,
-                "response": "Hello! How can I assist you with your appointment or customer inquiry today?",
-                "intent": "greeting"
-            }
+                return json.loads(cleaned_content)
+            except httpx.HTTPError as he:
+                last_error = he
+                logger.warning(f"Ollama query attempt {attempt+1} failed ({type(he).__name__}: {str(he)})")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Failed to parse response from Qwen model: {str(e)}")
+                break
+
+        logger.error(f"Ollama connection error after retries: {last_error}")
+        return {
+            "thought": "Fallback response",
+            "tool_call": None,
+            "tool_args": None,
+            "response": "Hello! I'm here to assist you with your appointment or customer inquiry. How can I help you today?",
+            "intent": "greeting"
+        }
 
     @classmethod
     def _create_empty_state(cls) -> Dict[str, Any]:
