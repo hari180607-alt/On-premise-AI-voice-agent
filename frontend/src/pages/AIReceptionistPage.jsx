@@ -122,10 +122,10 @@ export default function AIReceptionistPage() {
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
         console.log('[VOICE] Blob type:', audioBlob.type, '| size:', audioBlob.size, 'bytes, chunks:', audioChunksRef.current.length);
 
-        if (!audioBlob || audioBlob.size < 100) {
-          console.warn('[VOICE] Empty audio recording received.');
+        if (!audioBlob || audioBlob.size < 2500) {
+          console.warn('[VOICE] Empty or too short audio recording received:', audioBlob?.size, 'bytes.');
           setVoiceStage('error');
-          setVoiceStatusText("❌ Could not understand the audio.");
+          setVoiceStatusText("❌ Recording too short. Please hold the mic and speak clearly.");
           setTimeout(() => { setVoiceStage('idle'); setVoiceStatusText(''); }, 4000);
           return;
         }
@@ -137,7 +137,7 @@ export default function AIReceptionistPage() {
       recorder.start(250);
       setIsRecording(true);
       setVoiceStage('recording');
-      setVoiceStatusText("🎙️ Listening...");
+      setVoiceStatusText("🎙️ Listening... (click to stop)");
       console.log('[VOICE] Recording started with 250ms timeslice');
     } catch (err) {
       console.error("[VOICE] Microphone access error:", err);
@@ -150,6 +150,13 @@ export default function AIReceptionistPage() {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        if (mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.requestData();
+        }
+      } catch (e) {
+        console.warn('[VOICE] requestData failed:', e);
+      }
       mediaRecorderRef.current.stop();
     }
   };
