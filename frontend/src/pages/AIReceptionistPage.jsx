@@ -53,8 +53,13 @@ export default function AIReceptionistPage() {
   const [conversationId, setConversationId] = useState(() => generateSessionId());
   
   // AI Engine Status States
-  const [backendStatus, setBackendStatus] = useState(null);
-  const [ollamaStatus, setOllamaStatus] = useState(null);
+  const [healthState, setHealthState] = useState('checking'); // 'checking' | 'healthy' | 'unhealthy'
+  const [backendOnline, setBackendOnline] = useState(null);
+  const [databaseConnected, setDatabaseConnected] = useState(null);
+  const [aiOnline, setAiOnline] = useState(null);
+  const [voiceReady, setVoiceReady] = useState(null);
+  const [healthData, setHealthData] = useState(null);
+  const [checkingLoading, setCheckingLoading] = useState(false);
   
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -101,30 +106,47 @@ export default function AIReceptionistPage() {
     }
   };
 
-  // Poll server and Ollama status
-  useEffect(() => {
-    let isMounted = true;
-    const checkStatus = async () => {
-      try {
-        const health = await healthService.getHealthStatus();
-        if (isMounted) {
-          setBackendStatus(health.status === 'healthy');
-          setOllamaStatus(health.ollama ? health.ollama.connected : false);
-        }
-      } catch (err) {
-        if (isMounted) {
-          setBackendStatus(false);
-          setOllamaStatus(false);
-        }
-      }
-    };
+  const checkHealthStatus = async () => {
+    setCheckingLoading(true);
+    try {
+      const health = await healthService.getHealthStatus();
+      setHealthData(health);
 
-    checkStatus();
-    const interval = setInterval(checkStatus, 10000);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
+      const isBackendUp = health && (health.status === 'healthy' || health.backend?.connected === true);
+      const isDbUp = health?.database?.connected === true;
+      const isAiUp = health?.ollama?.connected === true && health?.ollama?.model_available === true;
+      const isVoiceUp = health?.voice?.whisper_stt === true || health?.voice?.tts === true;
+
+      setBackendOnline(isBackendUp);
+      setDatabaseConnected(isDbUp);
+      setAiOnline(isAiUp);
+      setVoiceReady(isVoiceUp);
+      setHealthState(isBackendUp ? 'healthy' : 'unhealthy');
+
+      // Task 13: Console debug logging
+      console.log('[Health] Backend:', isBackendUp ? 'ONLINE' : 'OFFLINE');
+      console.log('[Health] MongoDB:', isDbUp ? 'ONLINE' : 'OFFLINE');
+      console.log('[Health] Ollama:', health?.ollama?.connected ? 'ONLINE' : 'OFFLINE');
+      console.log('[Health] Model qwen3:4b:', health?.ollama?.model_available ? 'AVAILABLE' : 'UNAVAILABLE');
+      console.log('[Health] Whisper:', health?.voice?.whisper_stt ? 'AVAILABLE' : 'UNAVAILABLE');
+      console.log('[Health] TTS:', health?.voice?.tts ? 'AVAILABLE' : 'UNAVAILABLE');
+    } catch (err) {
+      console.error('[Health] System health check failed:', err);
+      setBackendOnline(false);
+      setDatabaseConnected(false);
+      setAiOnline(false);
+      setVoiceReady(false);
+      setHealthState('unhealthy');
+    } finally {
+      setCheckingLoading(false);
+    }
+  };
+
+  // Poll server and Ollama status every 10 seconds
+  useEffect(() => {
+    checkHealthStatus();
+    const interval = setInterval(checkHealthStatus, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   // Auto-scroll to latest message inside conversation box
@@ -222,19 +244,77 @@ export default function AIReceptionistPage() {
       {/* Top Workspace Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 shrink-0 bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
         <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-extrabold text-slate-900 tracking-tight">AI Receptionist</h1>
-            {ollamaStatus === true ? (
+          <div className="flex items-center gap-2 flex-wrap">
+            <h1 className="text-xl font-extrabold text-slate-900 tracking-tight mr-1">AI Receptionist</h1>
+            
+            {/* Backend Status Pill */}
+            {healthState === 'checking' && backendOnline === null ? (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
+                Checking system...
+              </span>
+            ) : backendOnline ? (
               <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                Local AI Online
+                <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                Backend Online
               </span>
             ) : (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200">
-                <span className="w-2 h-2 rounded-full bg-amber-500" />
-                AI Offline
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                <span className="w-2 h-2 rounded-full bg-rose-500" />
+                Backend Offline
               </span>
             )}
+
+            {/* Local AI Status Pill */}
+            {backendOnline && (
+              aiOnline ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  Local AI Online
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                  <span className="w-2 h-2 rounded-full bg-amber-500" />
+                  AI Offline
+                </span>
+              )
+            )}
+
+            {/* Database Status Pill */}
+            {backendOnline && (
+              databaseConnected ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                  Database Connected
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                  <span className="w-2 h-2 rounded-full bg-rose-500" />
+                  Database Offline
+                </span>
+              )
+            )}
+
+            {/* Voice Status Pill */}
+            {backendOnline && (
+              <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                voiceReady ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-600 border border-slate-200'
+              }`}>
+                <span className={`w-2 h-2 rounded-full ${voiceReady ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                {voiceReady ? 'Voice Ready' : 'Voice Offline'}
+              </span>
+            )}
+
+            {/* Manual Retry Button */}
+            <button
+              onClick={checkHealthStatus}
+              disabled={checkingLoading}
+              className="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full border border-slate-200 transition-colors shadow-xs ml-1"
+              title="Re-check system status"
+            >
+              <IoRefreshOutline className={`w-3.5 h-3.5 ${checkingLoading ? 'animate-spin' : ''}`} />
+              <span>Retry</span>
+            </button>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
             Autonomous customer service & appointment management workspace
@@ -428,16 +508,47 @@ export default function AIReceptionistPage() {
             </button>
           </div>
 
+          {/* Status Alert Banners */}
+          {backendOnline === false && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-700 text-xs font-medium flex items-center justify-between shadow-xs">
+              <span className="flex items-center gap-2">
+                <IoAlertCircleSharp className="w-4 h-4 text-rose-600 shrink-0" />
+                Backend is unavailable. Please start the FastAPI server on port 8000.
+              </span>
+              <button onClick={checkHealthStatus} className="underline font-bold hover:text-rose-900 shrink-0">
+                Retry Connection
+              </button>
+            </div>
+          )}
+
+          {backendOnline && aiOnline === false && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs font-medium flex items-center justify-between shadow-xs">
+              <span className="flex items-center gap-2">
+                <IoAlertCircleSharp className="w-4 h-4 text-amber-600 shrink-0" />
+                Local AI engine is unavailable. Please start Ollama with model qwen3:4b.
+              </span>
+              <button onClick={checkHealthStatus} className="underline font-bold hover:text-amber-900 shrink-0">
+                Retry
+              </button>
+            </div>
+          )}
+
           {/* Form Message Input */}
           <form onSubmit={(e) => { e.preventDefault(); handleSendMessage(); }} className="flex items-center gap-3">
             <input
               ref={inputRef}
               type="text"
-              placeholder={isRecording ? "Listening to your voice..." : "Type your message to the AI receptionist... (Press Enter to send)"}
+              placeholder={
+                backendOnline === false
+                  ? "Backend is unavailable. Please start the FastAPI server..."
+                  : isRecording
+                  ? "Listening to your voice..."
+                  : "Type your message to the AI receptionist... (Press Enter to send)"
+              }
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={loading || isRecording}
+              disabled={loading || isRecording || backendOnline === false}
               className="flex-1 px-4 py-3 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 transition-all disabled:bg-slate-100 disabled:text-slate-400 placeholder:text-slate-400"
             />
             
@@ -445,7 +556,7 @@ export default function AIReceptionistPage() {
             <button
               type="button"
               onClick={isRecording ? stopRecording : startRecording}
-              disabled={loading || recordingLoading}
+              disabled={loading || recordingLoading || backendOnline === false}
               title={isRecording ? "Stop Voice Recording" : "Speak to AI Receptionist"}
               className={`p-3 rounded-xl font-semibold transition-all shadow-xs flex items-center justify-center shrink-0 disabled:opacity-50 ${
                 isRecording
@@ -458,7 +569,7 @@ export default function AIReceptionistPage() {
 
             <button
               type="submit"
-              disabled={loading || !inputText.trim() || isRecording}
+              disabled={loading || !inputText.trim() || isRecording || backendOnline === false}
               className="px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold transition-all shadow-xs flex items-center justify-center gap-2 shrink-0 disabled:opacity-50 disabled:hover:bg-blue-600 text-sm"
             >
               <span>Send</span>

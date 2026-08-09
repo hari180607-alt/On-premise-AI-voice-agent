@@ -43,6 +43,9 @@ async def health_check():
 
     return {
         "status": "healthy",
+        "backend": {
+            "connected": True
+        },
         "database": {
             "connected": db_connected,
             "status": db_status
@@ -54,8 +57,8 @@ async def health_check():
             "model_available": model_available
         },
         "voice": {
-            "whisper_stt": "Available (Local tiny.en)",
-            "tts": "Available (Local pyttsx3/SAPI5)"
+            "whisper_stt": True,
+            "tts": True
         }
     }
 
