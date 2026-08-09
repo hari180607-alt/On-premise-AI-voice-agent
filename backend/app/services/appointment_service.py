@@ -128,3 +128,32 @@ class AppointmentService:
                 detail=f"Appointment with ID '{appointment_id}' not found."
             )
         return True
+
+    @classmethod
+    async def cancel_appointment(cls, appointment_id: str, customer_id: Optional[str] = None) -> dict:
+        """Cancel an appointment by setting status = 'Cancelled' without deleting document."""
+        obj_id = cls._validate_object_id(appointment_id)
+        collection = cls.get_collection()
+
+        appointment = await collection.find_one({"_id": obj_id})
+        if not appointment:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Appointment with ID '{appointment_id}' not found."
+            )
+
+        if customer_id and appointment.get("customer_id") != customer_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Appointment does not belong to the verified customer."
+            )
+
+        if appointment.get("status") == "Cancelled":
+            return cls._format_appointment(appointment)
+
+        result = await collection.find_one_and_update(
+            {"_id": obj_id},
+            {"$set": {"status": "Cancelled", "updated_at": datetime.now(timezone.utc)}},
+            return_document=True
+        )
+        return cls._format_appointment(result)

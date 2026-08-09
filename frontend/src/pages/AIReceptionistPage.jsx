@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { chatService } from '../services/chatService';
 import { healthService } from '../services/healthService';
+import { voiceService } from '../services/voiceService';
 import {
   IoSend,
   IoHardwareChipOutline,
@@ -13,6 +14,10 @@ import {
   IoPeopleOutline,
   IoTimeOutline,
   IoSparklesOutline,
+  IoCloseCircleOutline,
+  IoMicOutline,
+  IoMicOffOutline,
+  IoVolumeHighOutline,
 } from 'react-icons/io5';
 
 // Helper to generate unique conversation session id
@@ -38,6 +43,12 @@ export default function AIReceptionistPage() {
   const [errorMsg, setErrorMsg] = useState(null);
   const [lastFailedMessage, setLastFailedMessage] = useState(null);
   
+  // Voice Recording State
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingLoading, setRecordingLoading] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  
   // Unique session ID
   const [conversationId, setConversationId] = useState(() => generateSessionId());
   
@@ -47,6 +58,48 @@ export default function AIReceptionistPage() {
   
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+
+      mediaRecorderRef.current.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      mediaRecorderRef.current.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        setRecordingLoading(true);
+        try {
+          const res = await voiceService.transcribeAudio(audioBlob);
+          if (res && res.text) {
+            handleSendMessage(res.text);
+          }
+        } catch (err) {
+          console.error("STT transcription error:", err);
+        } finally {
+          setRecordingLoading(false);
+        }
+      };
+
+      mediaRecorderRef.current.start();
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Microphone permission error:", err);
+      setErrorMsg("Microphone access is required for voice input.");
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
 
   // Poll server and Ollama status
   useEffect(() => {
@@ -249,6 +302,26 @@ export default function AIReceptionistPage() {
                       : 'bg-blue-600 text-white rounded-tr-xs font-normal'
                   }`}>
                     <p className="whitespace-pre-wrap">{msg.text}</p>
+
+                    {/* Interactive Confirmation Buttons for Cancel Flow */}
+                    {isAi && msg.text.includes("Are you sure you want to cancel this appointment?") && (
+                      <div className="mt-3 flex items-center gap-2 pt-2 border-t border-slate-200/80">
+                        <button
+                          onClick={() => handleSendMessage("Confirm Cancellation", "cancel_appointment")}
+                          disabled={loading}
+                          className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-semibold rounded-lg text-xs shadow-xs transition-colors disabled:opacity-50"
+                        >
+                          Confirm Cancellation
+                        </button>
+                        <button
+                          onClick={() => handleSendMessage("Keep Appointment", "cancel_appointment")}
+                          disabled={loading}
+                          className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold rounded-lg text-xs shadow-xs transition-colors disabled:opacity-50"
+                        >
+                          Keep Appointment
+                        </button>
+                      </div>
+                    )}
                     
                     {/* Action Completed Indicator */}
                     {isAi && msg.actionPerformed && (
@@ -337,6 +410,15 @@ export default function AIReceptionistPage() {
             </button>
 
             <button
+              onClick={() => handleQuickAction("Cancel my appointment.", "cancel_appointment")}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-slate-700 font-medium hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-all shrink-0 shadow-xs disabled:opacity-50"
+            >
+              <IoCloseCircleOutline className="w-3.5 h-3.5 text-rose-500" />
+              <span>Cancel Appointment</span>
+            </button>
+
+            <button
               onClick={() => handleQuickAction("What are your business hours?", "general_question")}
               disabled={loading}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-slate-700 font-medium hover:bg-blue-50 hover:text-blue-600 hover:border-blue-200 transition-all shrink-0 shadow-xs disabled:opacity-50"
@@ -351,16 +433,32 @@ export default function AIReceptionistPage() {
             <input
               ref={inputRef}
               type="text"
-              placeholder="Type your message to the AI receptionist... (Press Enter to send)"
+              placeholder={isRecording ? "Listening to your voice..." : "Type your message to the AI receptionist... (Press Enter to send)"}
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={loading}
+              disabled={loading || isRecording}
               className="flex-1 px-4 py-3 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 transition-all disabled:bg-slate-100 disabled:text-slate-400 placeholder:text-slate-400"
             />
+            
+            {/* Microphone Voice Input Button */}
+            <button
+              type="button"
+              onClick={isRecording ? stopRecording : startRecording}
+              disabled={loading || recordingLoading}
+              title={isRecording ? "Stop Voice Recording" : "Speak to AI Receptionist"}
+              className={`p-3 rounded-xl font-semibold transition-all shadow-xs flex items-center justify-center shrink-0 disabled:opacity-50 ${
+                isRecording
+                  ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse'
+                  : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/80'
+              }`}
+            >
+              {isRecording ? <IoMicOffOutline className="w-5 h-5" /> : <IoMicOutline className="w-5 h-5 text-blue-600" />}
+            </button>
+
             <button
               type="submit"
-              disabled={loading || !inputText.trim()}
+              disabled={loading || !inputText.trim() || isRecording}
               className="px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold transition-all shadow-xs flex items-center justify-center gap-2 shrink-0 disabled:opacity-50 disabled:hover:bg-blue-600 text-sm"
             >
               <span>Send</span>

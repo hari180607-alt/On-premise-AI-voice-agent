@@ -74,3 +74,15 @@ async def delete_appointment(id: str):
     """Delete appointment record by ID."""
     await AppointmentService.delete_appointment(id)
     return None
+
+
+@router.patch(
+    "/{id}/cancel",
+    response_model=AppointmentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Cancel Appointment",
+    description="Cancel an appointment by ID setting status = 'Cancelled' without deleting document.",
+)
+async def cancel_appointment(id: str, customer_id: Optional[str] = Query(None, description="Optional customer ID verification")):
+    """Cancel an appointment."""
+    return await AppointmentService.cancel_appointment(id, customer_id)

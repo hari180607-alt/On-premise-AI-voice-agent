@@ -30,4 +30,11 @@ export const appointmentService = {
     const response = await api.delete(`/appointments/${id}`);
     return response.data;
   },
+
+  // PATCH /appointments/{id}/cancel
+  async cancelAppointment(id, customerId = null) {
+    const params = customerId ? { customer_id: customerId } : {};
+    const response = await api.patch(`/appointments/${id}/cancel`, null, { params });
+    return response.data;
+  },
 };

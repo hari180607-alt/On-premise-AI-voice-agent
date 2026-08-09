@@ -167,17 +167,23 @@ Output Schema:
 
     @classmethod
     async def query_ollama(cls, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Send async request to local Ollama server using shared connection pool."""
+        """Send async request to local Ollama server using shared connection pool with thinking suppression."""
         url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+
+        # Pre-fill assistant message with closing think tag to suppress qwen3 thinking lag
+        chat_messages = list(messages)
+        if chat_messages and chat_messages[-1]["role"] != "assistant":
+            chat_messages.append({"role": "assistant", "content": "<think>\n</think>"})
+
         payload = {
             "model": settings.OLLAMA_MODEL,
-            "messages": messages,
+            "messages": chat_messages,
             "stream": False,
             "format": "json",
-            "keep_alive": "10m",
+            "keep_alive": "30m",
             "options": {
-                "temperature": 0.2,
-                "num_predict": 100
+                "temperature": 0.15,
+                "num_predict": 128
             }
         }
 
@@ -211,7 +217,7 @@ Output Schema:
                 "thought": "Fallback response",
                 "tool_call": None,
                 "tool_args": None,
-                "response": "Hello! How can I assist you with your appointments or customer inquiry today?",
+                "response": "Hello! How can I assist you with your appointment or customer inquiry today?",
                 "intent": "greeting"
             }
 
@@ -226,7 +232,8 @@ Output Schema:
             "name": None,
             "phone": None,
             "customer_id": None,
-            "active_appts": []
+            "active_appts": [],
+            "cancel_target": None
         }
 
     @classmethod
@@ -388,16 +395,16 @@ Output Schema:
                 "action_performed": False
             }
 
-        # D. CANCEL APPOINTMENT INTENT (REQUIRES PHONE IDENTIFICATION)
+        # D. CANCEL APPOINTMENT INTENT (REQUIRES PHONE IDENTIFICATION & CONFIRMATION)
         if target_intent == "cancel_appointment":
-            if state["step"] != "waiting_for_cancel_phone" and state["step"] != "waiting_for_cancel_selection":
+            if state["step"] not in ["waiting_for_cancel_phone", "waiting_for_cancel_selection", "waiting_for_cancel_confirm"]:
                 session_states[conversation_id] = cls._create_empty_state()
                 state = session_states[conversation_id]
                 state["intent"] = "cancel_appointment"
                 state["step"] = "waiting_for_cancel_phone"
                 logger.info("INFO: Intent: cancel_appointment | Prompting for customer phone")
                 return {
-                    "response": "Sure. Please provide your phone number so I can find your appointment to cancel.",
+                    "response": "Sure, I can help you cancel an appointment. Please provide your phone number.",
                     "intent": "cancel_appointment",
                     "action_performed": False
                 }
@@ -412,56 +419,96 @@ Output Schema:
                 if not target_cust:
                     session_states[conversation_id] = cls._create_empty_state()
                     return {
-                        "response": f"I couldn't find a customer profile registered with phone number '{phone_input}'.",
+                        "response": f"I couldn't find a customer with that phone number ({phone_input}). Please check the number and try again.",
                         "intent": "cancel_appointment",
                         "action_performed": False
                     }
 
-                appts = await AppointmentService.get_appointments(0, 50, customer_id_filter=target_cust["id"])
+                # Query active booked appointments for this customer only
+                appts = await AppointmentService.get_appointments(0, 50, status_filter="Booked", customer_id_filter=target_cust["id"])
                 if not appts:
                     session_states[conversation_id] = cls._create_empty_state()
                     return {
-                        "response": f"No active appointments found to cancel for {target_cust['name']} ({phone_input}).",
+                        "response": f"You don't have any active booked appointments to cancel under phone number '{phone_input}'.",
                         "intent": "cancel_appointment",
                         "action_performed": False
                     }
 
                 if len(appts) == 1:
-                    await AppointmentService.delete_appointment(appts[0]["id"])
-                    session_states[conversation_id] = cls._create_empty_state()
-                    logger.info(f"INFO: Cancelled single appointment {appts[0]['id']} for customer {target_cust['id']}")
+                    state["cancel_target"] = appts[0]
+                    state["step"] = "waiting_for_cancel_confirm"
+                    target = appts[0]
                     return {
-                        "response": f"Your appointment for {appts[0]['service']} on {appts[0]['appointment_date']} at {appts[0]['appointment_time']} has been cancelled successfully.",
+                        "response": f"You selected:\n• Service: {target['service']}\n• Date: {target['appointment_date']} at {target['appointment_time']}\n\nAre you sure you want to cancel this appointment?",
                         "intent": "cancel_appointment",
-                        "action_performed": True
+                        "action_performed": False
                     }
                 else:
                     state["active_appts"] = appts
                     state["step"] = "waiting_for_cancel_selection"
                     options_str = "\n".join([f"{idx+1}. {a['service']} — {a['appointment_date']} at {a['appointment_time']}" for idx, a in enumerate(appts)])
                     return {
-                        "response": f"Which appointment would you like to cancel?\n{options_str}\n\nPlease reply with the appointment number (e.g., 1 or 2).",
+                        "response": f"Here are your upcoming appointments. Please select the appointment you want to cancel:\n\n{options_str}\n\nPlease reply with the appointment number (e.g., 1 or 2).",
                         "intent": "cancel_appointment",
                         "action_performed": False
                     }
 
             if state["step"] == "waiting_for_cancel_selection":
+                decline_no = ["no", "keep appointment", "don't cancel", "actually don't cancel it", "keep it", "nevermind", "cancel no"]
+                if any(k in msg_clean for k in decline_no):
+                    session_states[conversation_id] = cls._create_empty_state()
+                    logger.info("INFO: Cancellation declined at selection step; appointment preserved.")
+                    return {
+                        "response": "No problem. Your appointment has been kept.",
+                        "intent": "cancel_appointment",
+                        "action_performed": False
+                    }
+
                 match = re.search(r'\b\d+\b', msg_clean)
-                if match and state["active_appts"]:
+                if match and state.get("active_appts"):
                     idx = int(match.group(0)) - 1
                     if 0 <= idx < len(state["active_appts"]):
                         target_appt = state["active_appts"][idx]
-                        await AppointmentService.delete_appointment(target_appt["id"])
-                        session_states[conversation_id] = cls._create_empty_state()
-                        logger.info(f"INFO: Cancelled appointment {target_appt['id']} via selection")
+                        state["cancel_target"] = target_appt
+                        state["step"] = "waiting_for_cancel_confirm"
                         return {
-                            "response": f"Your appointment for {target_appt['service']} on {target_appt['appointment_date']} at {target_appt['appointment_time']} has been cancelled.",
+                            "response": f"You selected:\n• Service: {target_appt['service']}\n• Date: {target_appt['appointment_date']} at {target_appt['appointment_time']}\n\nAre you sure you want to cancel this appointment?",
                             "intent": "cancel_appointment",
-                            "action_performed": True
+                            "action_performed": False
                         }
 
                 return {
                     "response": "Please enter a valid appointment number from the list above.",
+                    "intent": "cancel_appointment",
+                    "action_performed": False
+                }
+
+            if state["step"] == "waiting_for_cancel_confirm":
+                confirm_yes = ["yes", "confirm", "confirm cancellation", "sure", "cancel it", "yeah", "ok"]
+                decline_no = ["no", "keep appointment", "don't cancel", "actually don't cancel it", "keep it", "nevermind", "cancel no"]
+
+                if any(k in msg_clean for k in confirm_yes) and not any(k in msg_clean for k in ["no", "don't"]):
+                    target = state.get("cancel_target")
+                    if target:
+                        await AppointmentService.cancel_appointment(target["id"], target.get("customer_id"))
+                        session_states[conversation_id] = cls._create_empty_state()
+                        logger.info(f"INFO: Cancelled appointment {target['id']} in MongoDB Atlas")
+                        return {
+                            "response": f"Your {target['service']} appointment on {target['appointment_date']} at {target['appointment_time']} has been cancelled successfully.",
+                            "intent": "cancel_appointment",
+                            "action_performed": True
+                        }
+                elif any(k in msg_clean for k in decline_no):
+                    session_states[conversation_id] = cls._create_empty_state()
+                    logger.info("INFO: Cancellation declined by user; appointment preserved.")
+                    return {
+                        "response": "No problem. Your appointment has been kept.",
+                        "intent": "cancel_appointment",
+                        "action_performed": False
+                    }
+
+                return {
+                    "response": "Please reply with 'Confirm Cancellation' or 'Keep Appointment' to complete your request.",
                     "intent": "cancel_appointment",
                     "action_performed": False
                 }

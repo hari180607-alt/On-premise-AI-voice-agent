@@ -1,4 +1,5 @@
 """API routes package."""
+import asyncio
 import httpx
 from fastapi import APIRouter
 from app.database import db_manager
@@ -24,14 +25,21 @@ async def health_check():
 
     ollama_connected = False
     ollama_status = "Disconnected"
+    model_available = False
+
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            res = await client.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
-            if res.status_code == 200:
-                ollama_connected = True
-                ollama_status = "Connected"
+        async def _check_ollama():
+            async with httpx.AsyncClient(timeout=0.5) as client:
+                res = await client.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+                if res.status_code == 200:
+                    return True, "Connected", any(settings.OLLAMA_MODEL in m.get("name", "") for m in res.json().get("models", []))
+            return False, "Disconnected", False
+
+        ollama_connected, ollama_status, model_available = await asyncio.wait_for(_check_ollama(), timeout=0.5)
     except Exception as e:
+        ollama_connected = False
         ollama_status = f"Connection error: {str(e)}"
+        model_available = False
 
     return {
         "status": "healthy",
@@ -41,7 +49,13 @@ async def health_check():
         },
         "ollama": {
             "connected": ollama_connected,
-            "status": ollama_status
+            "status": ollama_status,
+            "model": settings.OLLAMA_MODEL,
+            "model_available": model_available
+        },
+        "voice": {
+            "whisper_stt": "Available (Local tiny.en)",
+            "tts": "Available (Local pyttsx3/SAPI5)"
         }
     }
 
