@@ -86,7 +86,13 @@ export default function AIReceptionistPage() {
 
     try {
       console.log('[VOICE] Requesting microphone permission...');
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
       const selectedMime = getSupportedMimeType();
       console.log('[VOICE] Supported MIME type:', selectedMime || 'default browser MIME');
 
@@ -114,7 +120,7 @@ export default function AIReceptionistPage() {
 
         const mimeType = recorder.mimeType || selectedMime || 'audio/webm';
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-        console.log('[VOICE] Blob type:', audioBlob.type, '| size:', audioBlob.size, 'bytes');
+        console.log('[VOICE] Blob type:', audioBlob.type, '| size:', audioBlob.size, 'bytes, chunks:', audioChunksRef.current.length);
 
         if (!audioBlob || audioBlob.size < 100) {
           console.warn('[VOICE] Empty audio recording received.');
@@ -127,11 +133,12 @@ export default function AIReceptionistPage() {
         await processVoiceRecording(audioBlob, mimeType);
       };
 
-      recorder.start();
+      // Pass timeslice 250ms to collect audio chunks continuously
+      recorder.start(250);
       setIsRecording(true);
       setVoiceStage('recording');
       setVoiceStatusText("🎙️ Listening...");
-      console.log('[VOICE] Recording started');
+      console.log('[VOICE] Recording started with 250ms timeslice');
     } catch (err) {
       console.error("[VOICE] Microphone access error:", err);
       setVoiceStage('error');

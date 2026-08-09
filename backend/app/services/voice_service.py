@@ -83,15 +83,25 @@ class VoiceService:
 
         logger.info(f"[VOICE] Raw blob size received by backend: {len(audio_bytes)} bytes | filename: '{filename}' | mime_ext: '{ext}'")
 
+        # === DEBUG: Save raw input to persistent debug directory ===
+        debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "debug_audio")
+        os.makedirs(debug_dir, exist_ok=True)
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_raw_path = os.path.join(debug_dir, f"raw_input_{ts}{ext}")
+        shutil.copy2(tmp_in_path, debug_raw_path)
+        logger.info(f"[VOICE][DEBUG] Saved raw mic input to: {debug_raw_path} ({len(audio_bytes)} bytes)")
+
         try:
             ffmpeg_bin = cls.get_ffmpeg_cmd()
-            # Run FFmpeg conversion: 16kHz, mono 1-channel, 16-bit PCM WAV
+            # Run FFmpeg conversion: 16kHz, mono 1-channel, 16-bit PCM WAV with volume normalization
             cmd = [
                 ffmpeg_bin,
                 "-y",
                 "-i", tmp_in_path,
                 "-ar", "16000",
                 "-ac", "1",
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
                 "-c:a", "pcm_s16le",
                 tmp_wav_path
             ]
@@ -104,7 +114,55 @@ class VoiceService:
             )
 
             wav_size = os.path.getsize(tmp_wav_path) if os.path.exists(tmp_wav_path) else 0
-            logger.info(f"[VOICE] FFmpeg converted WAV path: '{tmp_wav_path}' | size: {wav_size} bytes | exit code: {conv_res.returncode}")
+            logger.info(f"[VOICE] FFmpeg exit code: {conv_res.returncode} | converted WAV size: {wav_size} bytes")
+            if conv_res.stderr:
+                logger.info(f"[VOICE] FFmpeg stderr: {conv_res.stderr.strip()[:500]}")
+
+            # If loudnorm filter fails for any reason, fallback to basic conversion
+            if conv_res.returncode != 0 or wav_size < 100:
+                logger.warning("[VOICE] Loudnorm filter failed, falling back to standard PCM conversion...")
+                cmd_fallback = [
+                    ffmpeg_bin, "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", tmp_wav_path
+                ]
+                conv_res = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                )
+                wav_size = os.path.getsize(tmp_wav_path) if os.path.exists(tmp_wav_path) else 0
+
+            # === DEBUG: Save converted WAV and inspect amplitude ===
+            debug_wav_path = os.path.join(debug_dir, f"converted_{ts}.wav")
+            if os.path.exists(tmp_wav_path) and wav_size > 0:
+                shutil.copy2(tmp_wav_path, debug_wav_path)
+                logger.info(f"[VOICE][DEBUG] Saved converted WAV to: {debug_wav_path}")
+
+                # Inspect WAV amplitude
+                try:
+                    import wave
+                    import struct as struct_mod
+                    with wave.open(debug_wav_path, "rb") as wf:
+                        ch = wf.getnchannels()
+                        sw = wf.getsampwidth()
+                        fr = wf.getframerate()
+                        nf = wf.getnframes()
+                        dur = nf / fr if fr > 0 else 0
+                        raw_frames = wf.readframes(min(nf, fr * 2))  # Read up to 2 seconds
+                        if sw == 2 and len(raw_frames) >= 2:
+                            samples = struct_mod.unpack(f'<{len(raw_frames)//2}h', raw_frames)
+                            max_amp = max(abs(s) for s in samples) if samples else 0
+                            rms = (sum(s*s for s in samples) / len(samples)) ** 0.5 if samples else 0
+                        else:
+                            max_amp = 0
+                            rms = 0
+                        logger.info(
+                            f"[VOICE][DEBUG] Converted WAV properties: "
+                            f"channels={ch}, sample_width={sw}, framerate={fr}, "
+                            f"frames={nf}, duration={dur:.2f}s, "
+                            f"max_amplitude={max_amp}, RMS={rms:.1f} "
+                            f"({'HAS AUDIO' if max_amp > 100 else 'SILENT'})"
+                        )
+                except Exception as e:
+                    logger.warning(f"[VOICE][DEBUG] WAV inspection error: {e}")
 
             target_transcribe_path = tmp_wav_path if (conv_res.returncode == 0 and os.path.exists(tmp_wav_path) and wav_size > 100) else tmp_in_path
             if conv_res.returncode != 0:
@@ -115,7 +173,12 @@ class VoiceService:
             t_stt = time.time()
             result = await loop.run_in_executor(
                 None,
-                lambda: model.transcribe(target_transcribe_path, fp16=False)
+                lambda: model.transcribe(
+                    target_transcribe_path,
+                    fp16=False,
+                    language="en",
+                    initial_prompt="Receptionist appointment customer booking cancellation enquiry"
+                )
             )
             stt_latency = time.time() - t_stt
 
