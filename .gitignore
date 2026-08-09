@@ -49,3 +49,6 @@ node_modules/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Piper TTS binary and voice models (downloaded locally, too large for git)
+backend/piper/

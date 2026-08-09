@@ -41,6 +41,10 @@ async def health_check():
         ollama_status = f"Connection error: {str(e)}"
         model_available = False
 
+    # Check Piper TTS availability
+    from app.services.voice_service import _check_piper_available
+    piper_available = _check_piper_available()
+
     return {
         "status": "healthy",
         "backend": {
@@ -58,7 +62,9 @@ async def health_check():
         },
         "voice": {
             "whisper_stt": True,
-            "tts": True
+            "tts": True,
+            "tts_engine": "piper" if piper_available else "pyttsx3",
+            "piper_available": piper_available
         }
     }
 

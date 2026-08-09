@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import asyncio
 import subprocess
-import pyttsx3
+import time
 import whisper
 from typing import Dict, Any, Optional
 
@@ -14,6 +14,13 @@ logger = logging.getLogger("uvicorn.error")
 FFMPEG_WIN_PATH = r"C:\Users\user\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0-full_build\bin"
 if os.path.exists(FFMPEG_WIN_PATH) and FFMPEG_WIN_PATH not in os.environ.get("PATH", ""):
     os.environ["PATH"] = FFMPEG_WIN_PATH + os.pathsep + os.environ.get("PATH", "")
+
+# Piper TTS Configuration — CLI binary approach (more reliable on Windows than pip package)
+# Voice: en_US-amy-medium — conversational tone, ideal for receptionist use case
+# Tradeoff: medium quality balances natural prosody with ~1s inference per sentence
+PIPER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "piper")
+PIPER_EXE = os.path.join(PIPER_DIR, "piper", "piper.exe")
+PIPER_MODEL = os.path.join(PIPER_DIR, "voices", "en_US-amy-medium.onnx")
 
 _whisper_model = None
 
@@ -27,8 +34,26 @@ def get_whisper_model():
     return _whisper_model
 
 
+def _check_piper_available() -> bool:
+    """Check if Piper binary and voice model are available."""
+    exe_ok = os.path.isfile(PIPER_EXE)
+    model_ok = os.path.isfile(PIPER_MODEL) and os.path.getsize(PIPER_MODEL) > 1_000_000
+    if not exe_ok:
+        logger.warning(f"[VOICE] Piper binary not found at: {PIPER_EXE}")
+    if not model_ok:
+        logger.warning(f"[VOICE] Piper voice model not found or too small at: {PIPER_MODEL}")
+    return exe_ok and model_ok
+
+
+# Log Piper availability on module load
+if _check_piper_available():
+    logger.info(f"[VOICE] Piper TTS ready: binary={PIPER_EXE}, model={os.path.basename(PIPER_MODEL)} ({os.path.getsize(PIPER_MODEL) / 1_000_000:.1f} MB)")
+else:
+    logger.warning("[VOICE] Piper TTS NOT available — falling back to pyttsx3/SAPI5")
+
+
 class VoiceService:
-    """Service layer handling local offline Whisper Speech-to-Text and TTS Speech Synthesis."""
+    """Service layer handling local offline Whisper Speech-to-Text and Piper TTS Speech Synthesis."""
 
     @classmethod
     def get_ffmpeg_cmd(cls) -> str:
@@ -87,13 +112,15 @@ class VoiceService:
 
             logger.info(f"[VOICE] Handing file '{target_transcribe_path}' ({os.path.getsize(target_transcribe_path)} bytes) to local Whisper model (tiny.en)...")
             model = get_whisper_model()
+            t_stt = time.time()
             result = await loop.run_in_executor(
                 None,
                 lambda: model.transcribe(target_transcribe_path, fp16=False)
             )
+            stt_latency = time.time() - t_stt
 
             text = result.get("text", "").strip()
-            logger.info(f"[VOICE] Whisper Transcript Result: '{text}'")
+            logger.info(f"[VOICE] Whisper Transcript Result: '{text}' | STT latency: {stt_latency:.2f}s")
             return text
 
         except Exception as e:
@@ -109,10 +136,89 @@ class VoiceService:
 
     @classmethod
     async def synthesize_speech(cls, text: str) -> bytes:
-        """Synthesize text into WAV audio using local pyttsx3 offline engine."""
+        """Synthesize text into WAV audio using local Piper TTS (with pyttsx3 fallback)."""
         clean_text = text.strip()
         if not clean_text:
             return b""
+
+        logger.info(f"[VOICE] TTS input: {len(clean_text)} chars | text: '{clean_text[:60]}...'")
+
+        # Try Piper TTS first (much higher quality, natural voice)
+        if _check_piper_available():
+            return await cls._synthesize_with_piper(clean_text)
+        else:
+            logger.info("[VOICE] Piper unavailable, falling back to pyttsx3/SAPI5")
+            return await cls._synthesize_with_pyttsx3(clean_text)
+
+    @classmethod
+    async def _synthesize_with_piper(cls, text: str) -> bytes:
+        """Synthesize text using local Piper CLI binary (en_US-amy-medium voice)."""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp_path = tmp.name
+
+        def _run_piper(input_text: str, output_path: str) -> subprocess.CompletedProcess:
+            cmd = [
+                PIPER_EXE,
+                "--model", PIPER_MODEL,
+                "--output_file", output_path,
+            ]
+            logger.info(f"[VOICE] Piper command: {' '.join(cmd)}")
+            return subprocess.run(
+                cmd,
+                input=input_text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+
+        try:
+            t_start = time.time()
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, lambda: _run_piper(text, tmp_path))
+            tts_latency = time.time() - t_start
+
+            if result.returncode != 0:
+                logger.error(f"[VOICE] Piper TTS failed (code {result.returncode}): {result.stderr.strip()[:300]}")
+                # Fall back to pyttsx3
+                return await cls._synthesize_with_pyttsx3(text)
+
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 100:
+                logger.error(f"[VOICE] Piper TTS produced no/empty output file")
+                return await cls._synthesize_with_pyttsx3(text)
+
+            with open(tmp_path, "rb") as f:
+                wav_bytes = f.read()
+
+            # Parse WAV duration from file size (22050 Hz, 16-bit, mono = 44100 bytes/sec + 44 header)
+            audio_duration = max(0, (len(wav_bytes) - 44)) / 44100.0
+            logger.info(
+                f"[VOICE] Piper TTS complete: {len(wav_bytes)} bytes | "
+                f"duration: {audio_duration:.2f}s | "
+                f"latency: {tts_latency:.2f}s | "
+                f"real-time factor: {tts_latency / audio_duration:.2f}x"
+                if audio_duration > 0 else
+                f"[VOICE] Piper TTS complete: {len(wav_bytes)} bytes | latency: {tts_latency:.2f}s"
+            )
+            return wav_bytes
+
+        except subprocess.TimeoutExpired:
+            logger.error("[VOICE] Piper TTS timed out after 30s, falling back to pyttsx3")
+            return await cls._synthesize_with_pyttsx3(text)
+        except Exception as e:
+            logger.error(f"[VOICE] Piper TTS error: {str(e)}", exc_info=True)
+            return await cls._synthesize_with_pyttsx3(text)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    @classmethod
+    async def _synthesize_with_pyttsx3(cls, text: str) -> bytes:
+        """Fallback TTS: synthesize text using local pyttsx3/SAPI5 engine."""
+        import pyttsx3
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp_path = tmp.name
@@ -131,16 +237,18 @@ class VoiceService:
             engine.runAndWait()
 
         try:
-            logger.info(f"[VOICE] Synthesizing TTS audio ({len(clean_text)} chars): '{clean_text[:40]}...'")
+            t_start = time.time()
+            logger.info(f"[VOICE] pyttsx3 fallback: synthesizing {len(text)} chars...")
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: _generate_wav(tmp_path, clean_text))
+            await loop.run_in_executor(None, lambda: _generate_wav(tmp_path, text))
+            tts_latency = time.time() - t_start
 
             with open(tmp_path, "rb") as f:
                 wav_bytes = f.read()
-            logger.info(f"[VOICE] TTS Synthesis complete: {len(wav_bytes)} WAV bytes generated.")
+            logger.info(f"[VOICE] pyttsx3 TTS complete: {len(wav_bytes)} bytes | latency: {tts_latency:.2f}s")
             return wav_bytes
         except Exception as e:
-            logger.error(f"[VOICE] Local TTS synthesis failed: {str(e)}", exc_info=True)
+            logger.error(f"[VOICE] pyttsx3 TTS failed: {str(e)}", exc_info=True)
             return b""
         finally:
             if os.path.exists(tmp_path):
