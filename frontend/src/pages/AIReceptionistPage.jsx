@@ -284,6 +284,8 @@ export default function AIReceptionistPage() {
     setRecordingLoading(false);
   };
 
+  const consecutiveFailuresRef = useRef(0);
+
   const checkHealthStatus = async () => {
     setCheckingLoading(true);
     try {
@@ -295,36 +297,60 @@ export default function AIReceptionistPage() {
       const isAiUp = health?.ollama?.connected === true && health?.ollama?.model_available === true;
       const isVoiceUp = health?.voice?.whisper_stt === true || health?.voice?.tts === true;
 
-      setBackendOnline(isBackendUp);
-      setDatabaseConnected(isDbUp);
-      setAiOnline(isAiUp);
-      setVoiceReady(isVoiceUp);
-      setHealthState(isBackendUp ? 'healthy' : 'unhealthy');
+      if (isBackendUp) {
+        consecutiveFailuresRef.current = 0;
+        setBackendOnline(true);
+        setDatabaseConnected(isDbUp);
+        setAiOnline(isAiUp);
+        setVoiceReady(isVoiceUp);
+        setHealthState('healthy');
+      } else {
+        consecutiveFailuresRef.current += 1;
+        console.warn(`[Health] Non-healthy response received (${consecutiveFailuresRef.current} consecutive failure(s))`);
+        if (consecutiveFailuresRef.current >= 2) {
+          setBackendOnline(false);
+          setDatabaseConnected(isDbUp);
+          setAiOnline(isAiUp);
+          setVoiceReady(isVoiceUp);
+          setHealthState('unhealthy');
+        }
+      }
 
-      // Task 13: Console debug logging
-      console.log('[Health] Backend:', isBackendUp ? 'ONLINE' : 'OFFLINE');
-      console.log('[Health] MongoDB:', isDbUp ? 'ONLINE' : 'OFFLINE');
-      console.log('[Health] Ollama:', health?.ollama?.connected ? 'ONLINE' : 'OFFLINE');
-      console.log('[Health] Model qwen3:4b:', health?.ollama?.model_available ? 'AVAILABLE' : 'UNAVAILABLE');
-      console.log('[Health] Whisper:', health?.voice?.whisper_stt ? 'AVAILABLE' : 'UNAVAILABLE');
-      console.log('[Health] TTS:', health?.voice?.tts ? 'AVAILABLE' : 'UNAVAILABLE');
+      // Console debug logging
+      console.log('[Health] Backend:', isBackendUp ? 'ONLINE' : 'OFFLINE', '| Consecutive failures:', consecutiveFailuresRef.current);
     } catch (err) {
-      console.error('[Health] System health check failed:', err);
-      setBackendOnline(false);
-      setDatabaseConnected(false);
-      setAiOnline(false);
-      setVoiceReady(false);
-      setHealthState('unhealthy');
+      consecutiveFailuresRef.current += 1;
+      console.error(`[Health] System health check failed (${consecutiveFailuresRef.current} consecutive failure(s)):`, err);
+      if (consecutiveFailuresRef.current >= 2) {
+        setBackendOnline(false);
+        setDatabaseConnected(false);
+        setAiOnline(false);
+        setVoiceReady(false);
+        setHealthState('unhealthy');
+      }
     } finally {
       setCheckingLoading(false);
     }
   };
 
-  // Poll server and Ollama status every 10 seconds
+  // Poll server status every 10 seconds & immediately on tab visibility change
   useEffect(() => {
     checkHealthStatus();
     const interval = setInterval(checkHealthStatus, 10000);
-    return () => clearInterval(interval);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        console.log('[Health] Tab became visible — running immediate health check');
+        checkHealthStatus();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, []);
 
   // Auto-scroll to latest message inside conversation box

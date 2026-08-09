@@ -15,24 +15,47 @@ export default function Navbar({ onMenuToggle }) {
   // Poll backend health status
   useEffect(() => {
     let isMounted = true;
+    let consecutiveFailures = 0;
+
     const checkHealth = async () => {
       try {
         const health = await healthService.getHealthStatus();
         if (isMounted) {
-          setBackendHealthy(health.status === 'healthy');
+          if (health && health.status === 'healthy') {
+            consecutiveFailures = 0;
+            setBackendHealthy(true);
+          } else {
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 2) {
+              setBackendHealthy(false);
+            }
+          }
         }
       } catch (err) {
         if (isMounted) {
-          setBackendHealthy(false);
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 2) {
+            setBackendHealthy(false);
+          }
         }
       }
     };
 
     checkHealth();
     const interval = setInterval(checkHealth, 10000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && isMounted) {
+        checkHealth();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
       isMounted = false;
       clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
 
