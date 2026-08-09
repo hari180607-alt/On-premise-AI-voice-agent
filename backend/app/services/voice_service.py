@@ -1,12 +1,19 @@
 import logging
 import os
+import shutil
 import tempfile
 import asyncio
+import subprocess
 import pyttsx3
 import whisper
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger("uvicorn.error")
+
+# Ensure FFmpeg is in PATH for Whisper and subprocess
+FFMPEG_WIN_PATH = r"C:\Users\user\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0-full_build\bin"
+if os.path.exists(FFMPEG_WIN_PATH) and FFMPEG_WIN_PATH not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = FFMPEG_WIN_PATH + os.pathsep + os.environ.get("PATH", "")
 
 _whisper_model = None
 
@@ -14,9 +21,9 @@ def get_whisper_model():
     """Lazy load lightweight local Whisper model."""
     global _whisper_model
     if _whisper_model is None:
-        logger.info("Loading local Whisper model (tiny.en)...")
+        logger.info("[VOICE] Loading local Whisper model (tiny.en)...")
         _whisper_model = whisper.load_model("tiny.en")
-        logger.info("Local Whisper model loaded successfully.")
+        logger.info("[VOICE] Local Whisper model loaded successfully.")
     return _whisper_model
 
 
@@ -24,36 +31,79 @@ class VoiceService:
     """Service layer handling local offline Whisper Speech-to-Text and TTS Speech Synthesis."""
 
     @classmethod
+    def get_ffmpeg_cmd(cls) -> str:
+        """Find executable ffmpeg command path."""
+        which_path = shutil.which("ffmpeg")
+        if which_path:
+            return which_path
+        exe_path = os.path.join(FFMPEG_WIN_PATH, "ffmpeg.exe")
+        if os.path.exists(exe_path):
+            return exe_path
+        return "ffmpeg"
+
+    @classmethod
     async def transcribe_audio(cls, audio_bytes: bytes, filename: str = "audio.webm") -> str:
-        """Transcribe uploaded audio file using local Whisper model."""
+        """Normalize uploaded browser audio via FFmpeg to 16kHz mono WAV and transcribe with Whisper."""
         if not audio_bytes or len(audio_bytes) < 100:
+            logger.warning("[VOICE] Received empty or too small audio blob (<100 bytes).")
             return ""
 
         ext = os.path.splitext(filename)[1] or ".webm"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_in:
+            tmp_in.write(audio_bytes)
+            tmp_in_path = tmp_in.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            tmp_wav_path = tmp_wav.name
+
+        logger.info(f"[VOICE] Received audio: {len(audio_bytes)} bytes, filename: '{filename}', mime_ext: '{ext}'")
 
         try:
-            model = get_whisper_model()
-            # Run Whisper transcription in threadpool executor to avoid blocking event loop
+            ffmpeg_bin = cls.get_ffmpeg_cmd()
+            logger.info(f"[VOICE] FFmpeg conversion: Converting '{tmp_in_path}' -> '{tmp_wav_path}' using {ffmpeg_bin}...")
+
+            # Run FFmpeg conversion: 16kHz, mono 1-channel, 16-bit PCM WAV
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-i", tmp_in_path,
+                "-ar", "16000",
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                tmp_wav_path
+            ]
+
             loop = asyncio.get_running_loop()
+            conv_res = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            )
+
+            target_transcribe_path = tmp_wav_path if (conv_res.returncode == 0 and os.path.exists(tmp_wav_path) and os.path.getsize(tmp_wav_path) > 100) else tmp_in_path
+            if conv_res.returncode != 0:
+                logger.warning(f"[VOICE] FFmpeg conversion warning (code {conv_res.returncode}): {conv_res.stderr.strip()[:200]}. Falling back to original input file.")
+
+            logger.info("[VOICE] Running local Whisper transcription...")
+            model = get_whisper_model()
             result = await loop.run_in_executor(
                 None,
-                lambda: model.transcribe(tmp_path, fp16=False)
+                lambda: model.transcribe(target_transcribe_path, fp16=False)
             )
+
             text = result.get("text", "").strip()
-            logger.info(f"Local Whisper Transcribed ({len(audio_bytes)} bytes): '{text}'")
+            logger.info(f"[VOICE] Whisper Transcript Result: '{text}'")
             return text
+
         except Exception as e:
-            logger.error(f"Whisper transcription failed: {str(e)}")
+            logger.error(f"[VOICE] Whisper transcription failed: {str(e)}", exc_info=True)
             return ""
         finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+            for p in (tmp_in_path, tmp_wav_path):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
     @classmethod
     async def synthesize_speech(cls, text: str) -> bytes:
@@ -79,14 +129,16 @@ class VoiceService:
             engine.runAndWait()
 
         try:
+            logger.info(f"[VOICE] Synthesizing TTS audio ({len(clean_text)} chars): '{clean_text[:40]}...'")
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: _generate_wav(tmp_path, clean_text))
 
             with open(tmp_path, "rb") as f:
                 wav_bytes = f.read()
+            logger.info(f"[VOICE] TTS Synthesis complete: {len(wav_bytes)} WAV bytes generated.")
             return wav_bytes
         except Exception as e:
-            logger.error(f"Local TTS synthesis failed: {str(e)}")
+            logger.error(f"[VOICE] Local TTS synthesis failed: {str(e)}", exc_info=True)
             return b""
         finally:
             if os.path.exists(tmp_path):

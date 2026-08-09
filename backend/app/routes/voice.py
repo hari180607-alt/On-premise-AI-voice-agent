@@ -20,7 +20,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
     
     audio_bytes = await file.read()
     text = await VoiceService.transcribe_audio(audio_bytes, file.filename or "audio.webm")
-    return {"text": text}
+    return {"success": True, "text": text}
 
 
 @router.post(

@@ -43,12 +43,6 @@ export default function AIReceptionistPage() {
   const [errorMsg, setErrorMsg] = useState(null);
   const [lastFailedMessage, setLastFailedMessage] = useState(null);
   
-  // Voice Recording State
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingLoading, setRecordingLoading] = useState(false);
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  
   // Unique session ID
   const [conversationId, setConversationId] = useState(() => generateSessionId());
   
@@ -64,46 +58,216 @@ export default function AIReceptionistPage() {
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
+  // Voice Recording & Pipeline State
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingLoading, setRecordingLoading] = useState(false);
+  const [voiceStage, setVoiceStage] = useState('idle'); // 'idle' | 'recording' | 'transcribing' | 'thinking' | 'speaking' | 'error'
+  const [voiceStatusText, setVoiceStatusText] = useState('');
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+
+  const getSupportedMimeType = () => {
+    const mimeTypes = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/mp4",
+      "audio/wav"
+    ];
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+      const match = mimeTypes.find(type => MediaRecorder.isTypeSupported(type));
+      if (match) return match;
+    }
+    return "";
+  };
+
   const startRecording = async () => {
+    if (loading || recordingLoading) return;
+
     try {
+      console.log('[VOICE] Requesting microphone permission...');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorderRef.current = new MediaRecorder(stream);
+      const selectedMime = getSupportedMimeType();
+      console.log('[VOICE] Supported MIME type:', selectedMime || 'default browser MIME');
+
+      const recorderOptions = selectedMime ? { mimeType: selectedMime } : {};
+      const recorder = new MediaRecorder(stream, recorderOptions);
+      mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
 
-      mediaRecorderRef.current.ondataavailable = (e) => {
-        if (e.data.size > 0) {
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
           audioChunksRef.current.push(e.data);
         }
       };
 
-      mediaRecorderRef.current.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        setRecordingLoading(true);
+      recorder.onstop = async () => {
+        console.log('[VOICE] Recording stopped.');
+        setIsRecording(false);
+        
+        // Stop audio tracks
         try {
-          const res = await voiceService.transcribeAudio(audioBlob);
-          if (res && res.text) {
-            handleSendMessage(res.text);
-          }
-        } catch (err) {
-          console.error("STT transcription error:", err);
-        } finally {
-          setRecordingLoading(false);
+          stream.getTracks().forEach(track => track.stop());
+        } catch (e) {
+          // ignore
         }
+
+        const mimeType = recorder.mimeType || selectedMime || 'audio/webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+        console.log('[VOICE] Blob type:', audioBlob.type, '| size:', audioBlob.size, 'bytes');
+
+        if (!audioBlob || audioBlob.size < 100) {
+          console.warn('[VOICE] Empty audio recording received.');
+          setVoiceStage('error');
+          setVoiceStatusText("❌ Could not understand the audio.");
+          setTimeout(() => { setVoiceStage('idle'); setVoiceStatusText(''); }, 4000);
+          return;
+        }
+
+        await processVoiceRecording(audioBlob, mimeType);
       };
 
-      mediaRecorderRef.current.start();
+      recorder.start();
       setIsRecording(true);
+      setVoiceStage('recording');
+      setVoiceStatusText("🎙️ Listening...");
+      console.log('[VOICE] Recording started');
     } catch (err) {
-      console.error("Microphone permission error:", err);
+      console.error("[VOICE] Microphone access error:", err);
+      setVoiceStage('error');
+      setVoiceStatusText("❌ Microphone access denied or unsupported.");
       setErrorMsg("Microphone access is required for voice input.");
+      setTimeout(() => { setVoiceStage('idle'); setVoiceStatusText(''); }, 4000);
     }
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
     }
+  };
+
+  const processVoiceRecording = async (audioBlob, mimeType) => {
+    setRecordingLoading(true);
+    setVoiceStage('transcribing');
+    setVoiceStatusText("⏳ Transcribing...");
+    console.log('[VOICE] Sending audio to Whisper...');
+
+    let transcript = "";
+    try {
+      const filename = mimeType.includes("mp4") ? "recording.mp4" : mimeType.includes("ogg") ? "recording.ogg" : "recording.webm";
+      const res = await voiceService.transcribeAudio(audioBlob, filename);
+      transcript = res?.text?.trim() || "";
+      console.log('[VOICE] Transcript:', `'${transcript}'`);
+    } catch (err) {
+      console.error('[VOICE] STT Transcription API error:', err);
+      setVoiceStage('error');
+      setVoiceStatusText("❌ Could not understand the audio.");
+      setRecordingLoading(false);
+      setTimeout(() => { setVoiceStage('idle'); setVoiceStatusText(''); }, 4000);
+      return;
+    }
+
+    if (!transcript) {
+      console.warn('[VOICE] Empty transcript received from Whisper.');
+      setVoiceStage('error');
+      setVoiceStatusText("❌ Could not understand the audio.");
+      setRecordingLoading(false);
+      setTimeout(() => { setVoiceStage('idle'); setVoiceStatusText(''); }, 4000);
+      return;
+    }
+
+    // Auto-send transcript to chat API
+    setVoiceStage('thinking');
+    setVoiceStatusText("🤖 AI thinking...");
+    console.log('[VOICE] Sending transcript to chat:', transcript);
+
+    let aiTextResponse = "";
+    try {
+      const userMsgId = `user-${Date.now()}`;
+      const userTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const userMsg = {
+        id: userMsgId,
+        sender: 'user',
+        text: transcript,
+        timestamp: userTime,
+      };
+
+      setMessages((prev) => [...prev, userMsg]);
+      setLoading(true);
+
+      const chatRes = await chatService.sendMessage(transcript, conversationId);
+      aiTextResponse = chatRes?.response || "";
+
+      const aiMsg = {
+        id: `ai-${Date.now()}`,
+        sender: 'ai',
+        text: aiTextResponse,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        actionPerformed: chatRes?.action_performed,
+        intent: chatRes?.intent,
+      };
+
+      setMessages((prev) => [...prev, aiMsg]);
+      console.log('[VOICE] AI response:', aiTextResponse);
+    } catch (err) {
+      console.error('[VOICE] Chat API failure:', err);
+      setVoiceStage('error');
+      setVoiceStatusText("❌ AI response failed.");
+      setLoading(false);
+      setRecordingLoading(false);
+      setTimeout(() => { setVoiceStage('idle'); setVoiceStatusText(''); }, 4000);
+      return;
+    } finally {
+      setLoading(false);
+    }
+
+    // Synthesize & play TTS voice
+    if (aiTextResponse) {
+      setVoiceStage('speaking');
+      setVoiceStatusText("🔊 AI speaking...");
+      console.log('[VOICE] Sending response to TTS...');
+
+      try {
+        const audioBytes = await voiceService.synthesizeSpeech(aiTextResponse);
+        if (audioBytes && audioBytes.size > 100) {
+          console.log('[VOICE] Audio received, size:', audioBytes.size, 'bytes. Playing audio...');
+          const audioUrl = URL.createObjectURL(audioBytes);
+          const audio = new Audio(audioUrl);
+          audio.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+            setVoiceStage('idle');
+            setVoiceStatusText('');
+          };
+          audio.onerror = () => {
+            URL.revokeObjectURL(audioUrl);
+            setVoiceStage('idle');
+            setVoiceStatusText('⚠️ Voice playback failed.');
+            setTimeout(() => setVoiceStatusText(''), 3000);
+          };
+          await audio.play().catch((e) => {
+            console.warn('[VOICE] Autoplay error:', e);
+            setVoiceStage('idle');
+            setVoiceStatusText('⚠️ Click play to hear response.');
+            setTimeout(() => setVoiceStatusText(''), 3000);
+          });
+        } else {
+          setVoiceStage('idle');
+          setVoiceStatusText('⚠️ AI text response received, but voice playback failed.');
+          setTimeout(() => setVoiceStatusText(''), 4000);
+        }
+      } catch (err) {
+        console.error('[VOICE] TTS API error:', err);
+        setVoiceStage('idle');
+        setVoiceStatusText('⚠️ AI text response received, but voice playback failed.');
+        setTimeout(() => setVoiceStatusText(''), 4000);
+      }
+    } else {
+      setVoiceStage('idle');
+      setVoiceStatusText('');
+    }
+
+    setRecordingLoading(false);
   };
 
   const checkHealthStatus = async () => {
@@ -530,6 +694,32 @@ export default function AIReceptionistPage() {
               <button onClick={checkHealthStatus} className="underline font-bold hover:text-amber-900 shrink-0">
                 Retry
               </button>
+            </div>
+          )}
+
+          {/* Voice Pipeline Stage Indicator */}
+          {voiceStatusText && (
+            <div className={`p-2.5 rounded-xl text-xs font-semibold flex items-center justify-between shadow-xs transition-all ${
+              voiceStage === 'recording'
+                ? 'bg-rose-50 border border-rose-200 text-rose-700 animate-pulse'
+                : voiceStage === 'transcribing' || voiceStage === 'thinking'
+                ? 'bg-blue-50 border border-blue-200 text-blue-700'
+                : voiceStage === 'speaking'
+                ? 'bg-emerald-50 border border-emerald-200 text-emerald-700'
+                : 'bg-amber-50 border border-amber-200 text-amber-800'
+            }`}>
+              <span className="flex items-center gap-2">
+                <span>{voiceStatusText}</span>
+              </span>
+              {isRecording && (
+                <button
+                  type="button"
+                  onClick={stopRecording}
+                  className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold rounded-md shadow-xs transition-colors"
+                >
+                  Stop Recording
+                </button>
+              )}
             </div>
           )}
 
