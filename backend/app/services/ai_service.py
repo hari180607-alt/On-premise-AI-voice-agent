@@ -133,15 +133,42 @@ def detect_intent(message: str) -> Optional[str]:
 
     # 6. Greeting Keywords
     greetings = ["hello", "hi", "hey", "good morning", "good afternoon", "greetings"]
-    if clean in greetings or any(clean.startswith(g) for g in ["hello", "hi ", "hey "]):
+    if clean in greetings or any(clean == g for g in greetings):
         return "greeting"
 
     # 7. Ask Question Keywords
-    question_kw = ["where are you located", "what services", "working hours", "business hours", "open hours"]
-    if any(k in clean for k in question_kw):
+    if is_user_question(message):
         return "ask_question"
 
     return None
+
+
+def is_user_question(message: str) -> bool:
+    """Detect if the user message is asking a question or requesting info."""
+    clean = message.strip().lower()
+    if clean.endswith("?"):
+        return True
+
+    question_triggers = [
+        "what service", "what services", "services do you", "services provided", "services offered",
+        "do you provide", "do you offer", "what do you", "what can you", "list services",
+        "where are you", "where is", "located", "location", "address",
+        "working hours", "business hours", "open hours", "operating hours",
+        "how much", "what is the cost", "price", "pricing", "rate",
+        "why do you", "why is", "can i ask", "tell me about"
+    ]
+    return any(trigger in clean for trigger in question_triggers)
+
+
+def is_booking_trigger(message: str) -> bool:
+    """Detect if the user message is a repeat of a booking command/trigger."""
+    clean = message.strip().lower()
+    book_triggers = [
+        "i want to book an appointment", "book an appointment", "hello, i want to book",
+        "i need an appointment", "i want an appointment", "schedule an appointment",
+        "schedule appointment", "want to book", "book appointment"
+    ]
+    return any(clean == trigger or clean.startswith(trigger) or trigger in clean for trigger in book_triggers)
 
 
 class AIService:
@@ -235,6 +262,100 @@ Output Schema:
             "active_appts": [],
             "cancel_target": None
         }
+
+    @classmethod
+    def validate_slot_input(cls, step: str, message: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Validate and classify input before slotting into the active step.
+        Returns a response dict if the input is a question or a repeat/restart trigger.
+        Returns None if input is a valid slot answer.
+        """
+        if not step:
+            return None
+
+        clean = message.strip().lower()
+
+        # 1. Check if user is asking a question mid-flow
+        if is_user_question(message):
+            logger.info(f"[SLOT_VALIDATION] User asked a question during step '{step}': '{message}'")
+
+            # A. Questions about services offered
+            if any(k in clean for k in ["service", "offer", "provide", "list"]):
+                services_str = "We offer General Consultation, Dental Checkup, Eye Examination, Health Inspection, and Haircut & Styling."
+                if step == "waiting_for_service":
+                    return {
+                        "response": f"{services_str} Which of these services would you like to book?",
+                        "intent": state.get("intent", "book_appointment"),
+                        "action_performed": False
+                    }
+                else:
+                    service_ctx = f"for your {state.get('service')} appointment" if state.get("service") else ""
+                    return {
+                        "response": f"{services_str} Continuing {service_ctx} — {cls._get_step_prompt(step, state)}",
+                        "intent": state.get("intent", "book_appointment"),
+                        "action_performed": False
+                    }
+
+            # B. Questions about location or operating hours
+            elif any(k in clean for k in ["location", "located", "address", "where"]):
+                return {
+                    "response": f"Our office is located at 123 Main Street, Suite 400. Continuing your booking — {cls._get_step_prompt(step, state)}",
+                    "intent": state.get("intent", "book_appointment"),
+                    "action_performed": False
+                }
+            elif any(k in clean for k in ["hours", "open", "working", "business"]):
+                return {
+                    "response": f"We are open Monday through Friday from 9:00 AM to 5:00 PM. Continuing your booking — {cls._get_step_prompt(step, state)}",
+                    "intent": state.get("intent", "book_appointment"),
+                    "action_performed": False
+                }
+            # C. Questions about phone number requirement
+            elif any(k in clean for k in ["phone", "why", "number"]):
+                return {
+                    "response": f"We use your phone number to look up your account and confirm your booking. {cls._get_step_prompt(step, state)}",
+                    "intent": state.get("intent", "book_appointment"),
+                    "action_performed": False
+                }
+            # Generic question fallback
+            else:
+                return {
+                    "response": f"I'm happy to answer your questions! To continue — {cls._get_step_prompt(step, state)}",
+                    "intent": state.get("intent", "book_appointment"),
+                    "action_performed": False
+                }
+
+        # 2. Check if user is repeating the booking trigger mid-flow
+        if is_booking_trigger(message) and step != "waiting_for_service":
+            logger.info(f"[SLOT_VALIDATION] User repeated booking trigger during step '{step}': '{message}'")
+            service = state.get("service", "an")
+            date = state.get("date")
+            ctx = f"{service} appointment" + (f" on {date}" if date else "")
+            return {
+                "response": f"You're already in the process of booking a {ctx}! {cls._get_step_prompt(step, state)} (or say 'start over' to reset)",
+                "intent": state.get("intent", "book_appointment"),
+                "action_performed": False
+            }
+
+        return None
+
+    @classmethod
+    def _get_step_prompt(cls, step: str, state: Dict[str, Any]) -> str:
+        """Helper to return the original slot prompt for re-asking."""
+        if step == "waiting_for_service":
+            return "What service would you like to book?"
+        elif step == "waiting_for_date":
+            return f"What date would you prefer for your {state.get('service', 'service')}?"
+        elif step == "waiting_for_time":
+            return f"What time would you prefer on {state.get('date', 'that date')}?"
+        elif step == "waiting_for_name":
+            return "May I have your full name?"
+        elif step == "waiting_for_phone":
+            return "Please provide your phone number to complete the booking."
+        elif step == "waiting_for_cancel_phone":
+            return "Please provide your phone number to find your appointment."
+        elif step == "waiting_for_view_phone":
+            return "Please provide your phone number to view your appointments."
+        return "How can I assist you?"
 
     @classmethod
     async def chat_agent(
@@ -526,6 +647,11 @@ Output Schema:
                     "intent": "book_appointment",
                     "action_performed": False
                 }
+
+            # Validate slot input (check if user is asking a question or repeating restart trigger)
+            slot_validation = cls.validate_slot_input(state["step"], message, state)
+            if slot_validation:
+                return slot_validation
 
             if state["step"] == "waiting_for_service":
                 state["service"] = message.strip()
