@@ -197,6 +197,8 @@ export default function AIReceptionistPage() {
     console.log('[VOICE] Sending transcript to chat:', transcript);
 
     let aiTextResponse = "";
+    let ttsPromise = null;
+
     try {
       const userMsgId = `user-${Date.now()}`;
       const userTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -210,8 +212,17 @@ export default function AIReceptionistPage() {
       setMessages((prev) => [...prev, userMsg]);
       setLoading(true);
 
+      const t0_chat = performance.now();
       const chatRes = await chatService.sendMessage(transcript, conversationId);
+      const t1_chat = performance.now();
       aiTextResponse = chatRes?.response || "";
+      console.log(`[VOICE] LLM response received in ${(t1_chat - t0_chat).toFixed(0)}ms:`, aiTextResponse);
+
+      // PARALLEL TTS: Dispatch TTS request immediately when text arrives, before React render delays
+      if (aiTextResponse) {
+        console.log('[VOICE] Parallel TTS synthesis dispatched at T=0ms relative to LLM response');
+        ttsPromise = voiceService.synthesizeSpeech(aiTextResponse);
+      }
 
       const aiMsg = {
         id: `ai-${Date.now()}`,
@@ -222,8 +233,9 @@ export default function AIReceptionistPage() {
         intent: chatRes?.intent,
       };
 
+      // Render text message in React UI immediately
       setMessages((prev) => [...prev, aiMsg]);
-      console.log('[VOICE] AI response:', aiTextResponse);
+      setLoading(false);
     } catch (err) {
       console.error('[VOICE] Chat API failure:', err);
       setVoiceStage('error');
@@ -236,18 +248,23 @@ export default function AIReceptionistPage() {
       setLoading(false);
     }
 
-    // Synthesize & play TTS voice
-    if (aiTextResponse) {
+    // Await parallel TTS synthesis and play audio
+    if (aiTextResponse && ttsPromise) {
       setVoiceStage('speaking');
       setVoiceStatusText("🔊 AI speaking...");
-      console.log('[VOICE] Sending response to TTS...');
 
       try {
-        const audioBytes = await voiceService.synthesizeSpeech(aiTextResponse);
+        const t0_render = performance.now();
+        const audioBytes = await ttsPromise;
+        const t1_audio = performance.now();
+        console.log(`[VOICE] TTS audio ready in ${(t1_audio - t0_render).toFixed(0)}ms after text rendered`);
+
         if (audioBytes && audioBytes.size > 100) {
-          console.log('[VOICE] Audio received, size:', audioBytes.size, 'bytes. Playing audio...');
           const audioUrl = URL.createObjectURL(audioBytes);
-          const audio = new Audio(audioUrl);
+          const audio = new Audio();
+          audio.src = audioUrl;
+          audio.preload = 'auto';
+
           audio.onended = () => {
             URL.revokeObjectURL(audioUrl);
             setVoiceStage('idle');
@@ -259,12 +276,16 @@ export default function AIReceptionistPage() {
             setVoiceStatusText('⚠️ Voice playback failed.');
             setTimeout(() => setVoiceStatusText(''), 3000);
           };
-          await audio.play().catch((e) => {
-            console.warn('[VOICE] Autoplay error:', e);
-            setVoiceStage('idle');
-            setVoiceStatusText('⚠️ Click play to hear response.');
-            setTimeout(() => setVoiceStatusText(''), 3000);
-          });
+
+          const playPromise = audio.play();
+          if (playPromise !== undefined) {
+            playPromise.catch((e) => {
+              console.warn('[VOICE] Autoplay error:', e);
+              setVoiceStage('idle');
+              setVoiceStatusText('⚠️ Click play to hear response.');
+              setTimeout(() => setVoiceStatusText(''), 3000);
+            });
+          }
         } else {
           setVoiceStage('idle');
           setVoiceStatusText('⚠️ AI text response received, but voice playback failed.');
