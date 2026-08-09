@@ -28,9 +28,9 @@ def get_whisper_model():
     """Lazy load lightweight local Whisper model."""
     global _whisper_model
     if _whisper_model is None:
-        logger.info("[VOICE] Loading local Whisper model (tiny.en)...")
-        _whisper_model = whisper.load_model("tiny.en")
-        logger.info("[VOICE] Local Whisper model loaded successfully.")
+        logger.info("[VOICE] Loading local Whisper model (base.en)...")
+        _whisper_model = whisper.load_model("base.en")
+        logger.info("[VOICE] Local Whisper model (base.en) loaded successfully.")
     return _whisper_model
 
 
@@ -86,11 +86,10 @@ class VoiceService:
         # === DEBUG: Save raw input to persistent debug directory ===
         debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "debug_audio")
         os.makedirs(debug_dir, exist_ok=True)
-        import datetime
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_raw_path = os.path.join(debug_dir, f"raw_input_{ts}{ext}")
+        
+        debug_raw_path = os.path.join(debug_dir, f"debug_01_raw_browser{ext}")
         shutil.copy2(tmp_in_path, debug_raw_path)
-        logger.info(f"[VOICE][DEBUG] Saved raw mic input to: {debug_raw_path} ({len(audio_bytes)} bytes)")
+        logger.info(f"[REAL_MIC_DEBUG][STAGE 1] Saved raw browser mic input: '{debug_raw_path}' | Size: {len(audio_bytes)} bytes | Filename: '{filename}' | Content-Type: '{ext}'")
 
         try:
             ffmpeg_bin = cls.get_ffmpeg_cmd()
@@ -105,7 +104,7 @@ class VoiceService:
                 "-c:a", "pcm_s16le",
                 tmp_wav_path
             ]
-            logger.info(f"[VOICE] FFmpeg command being run: {' '.join(cmd)}")
+            logger.info(f"[REAL_MIC_DEBUG][STAGE 2/3] FFmpeg command: {' '.join(cmd)}")
 
             loop = asyncio.get_running_loop()
             conv_res = await loop.run_in_executor(
@@ -114,13 +113,11 @@ class VoiceService:
             )
 
             wav_size = os.path.getsize(tmp_wav_path) if os.path.exists(tmp_wav_path) else 0
-            logger.info(f"[VOICE] FFmpeg exit code: {conv_res.returncode} | converted WAV size: {wav_size} bytes")
-            if conv_res.stderr:
-                logger.info(f"[VOICE] FFmpeg stderr: {conv_res.stderr.strip()[:500]}")
+            logger.info(f"[REAL_MIC_DEBUG][STAGE 3] FFmpeg exit code: {conv_res.returncode} | Converted WAV size: {wav_size} bytes")
 
-            # If loudnorm filter fails for any reason, fallback to basic conversion
+            # Fallback if loudnorm fails
             if conv_res.returncode != 0 or wav_size < 100:
-                logger.warning("[VOICE] Loudnorm filter failed, falling back to standard PCM conversion...")
+                logger.warning("[REAL_MIC_DEBUG] Loudnorm failed, running standard PCM conversion...")
                 cmd_fallback = [
                     ffmpeg_bin, "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", tmp_wav_path
                 ]
@@ -130,13 +127,13 @@ class VoiceService:
                 )
                 wav_size = os.path.getsize(tmp_wav_path) if os.path.exists(tmp_wav_path) else 0
 
-            # === DEBUG: Save converted WAV and inspect amplitude ===
-            debug_wav_path = os.path.join(debug_dir, f"converted_{ts}.wav")
+            # Save debug_02_converted.wav
+            debug_wav_path = os.path.join(debug_dir, "debug_02_converted.wav")
             if os.path.exists(tmp_wav_path) and wav_size > 0:
                 shutil.copy2(tmp_wav_path, debug_wav_path)
-                logger.info(f"[VOICE][DEBUG] Saved converted WAV to: {debug_wav_path}")
+                logger.info(f"[REAL_MIC_DEBUG][STAGE 3] Saved converted WAV: '{debug_wav_path}'")
 
-                # Inspect WAV amplitude
+                # Inspect WAV amplitude & properties
                 try:
                     import wave
                     import struct as struct_mod
@@ -146,7 +143,7 @@ class VoiceService:
                         fr = wf.getframerate()
                         nf = wf.getnframes()
                         dur = nf / fr if fr > 0 else 0
-                        raw_frames = wf.readframes(min(nf, fr * 2))  # Read up to 2 seconds
+                        raw_frames = wf.readframes(nf)  # Read all frames
                         if sw == 2 and len(raw_frames) >= 2:
                             samples = struct_mod.unpack(f'<{len(raw_frames)//2}h', raw_frames)
                             max_amp = max(abs(s) for s in samples) if samples else 0
@@ -155,20 +152,18 @@ class VoiceService:
                             max_amp = 0
                             rms = 0
                         logger.info(
-                            f"[VOICE][DEBUG] Converted WAV properties: "
-                            f"channels={ch}, sample_width={sw}, framerate={fr}, "
+                            f"[REAL_MIC_DEBUG][STAGE 3] WAV properties: "
+                            f"channels={ch}, sample_width={sw}B, framerate={fr}Hz, "
                             f"frames={nf}, duration={dur:.2f}s, "
                             f"max_amplitude={max_amp}, RMS={rms:.1f} "
-                            f"({'HAS AUDIO' if max_amp > 100 else 'SILENT'})"
+                            f"({'HAS AUDIO' if max_amp > 100 else 'SILENT AUDIO'})"
                         )
                 except Exception as e:
-                    logger.warning(f"[VOICE][DEBUG] WAV inspection error: {e}")
+                    logger.warning(f"[REAL_MIC_DEBUG][STAGE 3] WAV inspection error: {e}")
 
             target_transcribe_path = tmp_wav_path if (conv_res.returncode == 0 and os.path.exists(tmp_wav_path) and wav_size > 100) else tmp_in_path
-            if conv_res.returncode != 0:
-                logger.warning(f"[VOICE] FFmpeg conversion warning (code {conv_res.returncode}): {conv_res.stderr.strip()[:200]}. Falling back to original input file.")
 
-            logger.info(f"[VOICE] Handing file '{target_transcribe_path}' ({os.path.getsize(target_transcribe_path)} bytes) to local Whisper model (tiny.en)...")
+            logger.info(f"[REAL_MIC_DEBUG][STAGE 4] Handing file '{target_transcribe_path}' ({os.path.getsize(target_transcribe_path)} bytes) to local Whisper model (base.en)...")
             model = get_whisper_model()
             t_stt = time.time()
             result = await loop.run_in_executor(
@@ -183,7 +178,7 @@ class VoiceService:
             stt_latency = time.time() - t_stt
 
             text = result.get("text", "").strip()
-            logger.info(f"[VOICE] Whisper Transcript Result: '{text}' | STT latency: {stt_latency:.2f}s")
+            logger.info(f"[REAL_MIC_DEBUG][STAGE 4] Whisper Raw Transcript Output: '{text}' | STT latency: {stt_latency:.2f}s")
             return text
 
         except Exception as e:
