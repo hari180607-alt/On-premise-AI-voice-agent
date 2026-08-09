@@ -56,12 +56,10 @@ class VoiceService:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
             tmp_wav_path = tmp_wav.name
 
-        logger.info(f"[VOICE] Received audio: {len(audio_bytes)} bytes, filename: '{filename}', mime_ext: '{ext}'")
+        logger.info(f"[VOICE] Raw blob size received by backend: {len(audio_bytes)} bytes | filename: '{filename}' | mime_ext: '{ext}'")
 
         try:
             ffmpeg_bin = cls.get_ffmpeg_cmd()
-            logger.info(f"[VOICE] FFmpeg conversion: Converting '{tmp_in_path}' -> '{tmp_wav_path}' using {ffmpeg_bin}...")
-
             # Run FFmpeg conversion: 16kHz, mono 1-channel, 16-bit PCM WAV
             cmd = [
                 ffmpeg_bin,
@@ -72,6 +70,7 @@ class VoiceService:
                 "-c:a", "pcm_s16le",
                 tmp_wav_path
             ]
+            logger.info(f"[VOICE] FFmpeg command being run: {' '.join(cmd)}")
 
             loop = asyncio.get_running_loop()
             conv_res = await loop.run_in_executor(
@@ -79,11 +78,14 @@ class VoiceService:
                 lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             )
 
-            target_transcribe_path = tmp_wav_path if (conv_res.returncode == 0 and os.path.exists(tmp_wav_path) and os.path.getsize(tmp_wav_path) > 100) else tmp_in_path
+            wav_size = os.path.getsize(tmp_wav_path) if os.path.exists(tmp_wav_path) else 0
+            logger.info(f"[VOICE] FFmpeg converted WAV path: '{tmp_wav_path}' | size: {wav_size} bytes | exit code: {conv_res.returncode}")
+
+            target_transcribe_path = tmp_wav_path if (conv_res.returncode == 0 and os.path.exists(tmp_wav_path) and wav_size > 100) else tmp_in_path
             if conv_res.returncode != 0:
                 logger.warning(f"[VOICE] FFmpeg conversion warning (code {conv_res.returncode}): {conv_res.stderr.strip()[:200]}. Falling back to original input file.")
 
-            logger.info("[VOICE] Running local Whisper transcription...")
+            logger.info(f"[VOICE] Handing file '{target_transcribe_path}' ({os.path.getsize(target_transcribe_path)} bytes) to local Whisper model (tiny.en)...")
             model = get_whisper_model()
             result = await loop.run_in_executor(
                 None,

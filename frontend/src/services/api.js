@@ -3,10 +3,7 @@ import toast from 'react-hot-toast';
 
 const api = axios.create({
   baseURL: 'http://127.0.0.1:8000/api/v1',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-  timeout: 10000,
+  timeout: 60000,
 });
 
 // Response Interceptor for Global Error Handling
